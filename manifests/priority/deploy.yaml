@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: i-scheduler
+  namespace: kube-system
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: i-scheduler-clusterrolebinding
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: i-scheduler
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: kube-system
+data:
+  scheduler-config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    leaderElection:
+      leaderElect: false
+    profiles:
+    - schedulerName: i-scheduler
+      plugins:
+        filter:
+          enabled:
+          - name: Priority
+        score:
+          enabled:
+            - name: Priority
+          disabled:
+            - name: "*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: i-scheduler
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: i-scheduler
+  template:
+    metadata:
+      labels:
+        component: i-scheduler
+    spec:
+      serviceAccount: i-scheduler
+      priorityClassName: system-cluster-critical
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: scheduler-config
+      containers:
+        - name: i-scheduler
+          image: hub.sh.99cloud.net/lixd96/kube-scheduler:pripority
+          args:
+            - --config=/etc/kubernetes/scheduler-config.yaml
+            - --v=3
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /etc/kubernetes

@@ -57,6 +57,7 @@ build-controller:
 build-scheduler:
 	$(GO_BUILD_ENV) go build -ldflags '-X k8s.io/component-base/version.gitVersion=$(VERSION) -w' -o bin/kube-scheduler cmd/scheduler/main.go
 
+
 .PHONY: build-images
 build-images:
 	BUILDER=$(BUILDER) \

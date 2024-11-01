@@ -18,6 +18,7 @@ package main
 
 import (
 	"os"
+	"sigs.k8s.io/scheduler-plugins/pkg/priority"
 
 	"k8s.io/component-base/cli"
 	_ "k8s.io/component-base/metrics/prometheus/clientgo" // for rest client metric registration
@@ -62,6 +63,7 @@ func main() {
 		// app.WithPlugin(crossnodepreemption.Name, crossnodepreemption.New),
 		app.WithPlugin(podstate.Name, podstate.New),
 		app.WithPlugin(qos.Name, qos.New),
+		app.WithPlugin(priority.Name, priority.New),
 	)
 
 	code := cli.Run(command)
