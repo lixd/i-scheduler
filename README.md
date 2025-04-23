@@ -1,3 +1,313 @@
+# k8s 自定义调度器逻辑之 Scheduler Framework
+
+通过 Scheduler Framework 创建自己的调度器，新增调度插件自定义调度逻辑。
+
+
+Scheduler 系列完整内容见：[K8s 自定义调度器 Part2：通过 Scheduler Framework 实现自定义调度逻辑](https://www.lixueduan.com/posts/kubernetes/34-custom-scheduker-by-scheduler-framework/)
+
+
+## 微信公众号：探索云原生
+
+一个云原生打工人的探索之路，专注云原生，Go，坚持分享最佳实践、经验干货。
+
+扫描下面二维码，关注我即时获取更新~
+
+![](https://img.lixueduan.com/about/wechat/qrcode_search.png)
+
+## 部署
+
+### 构建镜像
+
+将自定义调度器打包成镜像
+
+```bash
+REGISTRY=docker.io/lixd96 RELEASE_VERSION=pripority PLATFORMS="linux/amd64,linux/arm64" DISTROLESS_BASE_IMAGE=busybox:1.36 make push-images
+```
+
+
+
+### 部署到集群
+
+scheduler-plugins 项目下 manifest/install 目录中有部署的 chart，我们只需要修改下 image 参数就行了。
+
+安装命令如下：
+
+```bash
+cd manifest/install 
+
+helm upgrade --install i-scheduler charts/as-a-second-scheduler --namespace kube-system -f charts/as-a-second-scheduler/values-demo.yaml
+```
+
+
+
+完整 values-demo.yaml 内容如下：
+
+```yaml
+# Default values for scheduler-plugins-as-a-second-scheduler.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+scheduler:
+  name: i-scheduler
+  image: lixd96/kube-scheduler:pripority
+
+controller:
+  replicaCount: 0
+
+# LoadVariationRiskBalancing and TargetLoadPacking are not enabled by default
+# as they need extra RBAC privileges on metrics.k8s.io.
+
+plugins:
+  enabled: ["Priority","Coscheduling","CapacityScheduling","NodeResourceTopologyMatch","NodeResourcesAllocatable"]
+```
+
+
+
+deploy.yaml 完整内容如下：
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: i-scheduler
+  namespace: kube-system
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: i-scheduler-clusterrolebinding
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: i-scheduler
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: kube-system
+data:
+  scheduler-config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    leaderElection:
+      leaderElect: false
+    profiles:
+    - schedulerName: i-scheduler
+      plugins:
+        filter:
+          enabled:
+          - name: Priority
+        score:
+          enabled:
+            - name: Priority
+          disabled:
+            - name: "*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: i-scheduler
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: i-scheduler
+  template:
+    metadata:
+      labels:
+        component: i-scheduler
+    spec:
+      serviceAccount: i-scheduler
+      priorityClassName: system-cluster-critical
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: scheduler-config
+      containers:
+        - name: i-scheduler
+          image: lixd96/kube-scheduler:pripority
+          args:
+            - --config=/etc/kubernetes/scheduler-config.yaml
+            - --v=3
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /etc/kubernetes
+```
+
+部署到集群
+
+```bash
+kubectl apply -f deploy.yaml 
+```
+
+
+
+确认已经跑起来了
+
+```bash
+[root@scheduler-1 install]# kubectl -n kube-system get po|grep i-scheduler
+i-scheduler-569bbd89bc-7p5v2                  1/1     Running            0          3m44s
+```
+
+
+
+## 测试
+
+
+### 创建 Pod
+
+创建一个 Deployment 并指定使用上一步中部署的 Scheduler，然后测试会调度到哪个节点上。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test
+  template:
+    metadata:
+      labels:
+        app: test
+    spec:
+      schedulerName: i-scheduler
+      containers:
+      - image: busybox:1.36
+        name: nginx
+        command: ["sleep"]         
+        args: ["99999"]
+```
+
+创建之后 Pod 会一直处于 Pending 状态
+
+```bash
+[root@scheduler-1 install]# k get po
+NAME                    READY   STATUS    RESTARTS   AGE
+test-7f7bb8f449-w6wvv   0/1     Pending   0          4s
+```
+
+查看具体情况
+
+```bash
+[root@scheduler-1 install]# kubectl describe po test-7f7bb8f449-w6wvv
+
+Events:
+  Type     Reason            Age   From         Message
+  ----     ------            ----  ----         -------
+  Warning  FailedScheduling  8s    i-scheduler  0/2 nodes are available: 1 Node:Node: scheduler-1 does not have label priority.lixueduan.com, 1 Node:Node: scheduler-2 does not have label priority.lixueduan.com. preemption: 0/2 nodes are available: 2 No preemption victims found for incoming pod.
+```
+
+可以看到，是因为 Node 上没有我们定义的 Label，因此都不满足条件，最终 Pod 就一直 Pending 了。
+
+
+
+### 添加 Label
+
+由于我们实现的 Filter 逻辑是需要 Node 上有`priority.lixueduan.com` 才会用来调度，否则直接会忽略。
+
+
+
+理论上，只要给任意一个 Node 打上 Label 就可以了。
+
+```bash
+[root@scheduler-1 install]# k get node
+NAME          STATUS   ROLES           AGE     VERSION
+scheduler-1   Ready    control-plane   4h34m   v1.27.4
+scheduler-2   Ready    <none>          4h33m   v1.27.4
+[root@scheduler-1 install]# k label node scheduler-1 priority.lixueduan.com=10
+node/scheduler-1 labeled
+```
+
+再次查看 Pod 状态
+
+```bash
+[root@scheduler-1 install]# k get po -owide
+NAME                    READY   STATUS    RESTARTS   AGE     IP               NODE          NOMINATED NODE   READINESS GATES
+test-7f7bb8f449-w6wvv   1/1     Running   0          4m20s   172.25.123.199   scheduler-1   <none>           <none>
+```
+
+已经被调度到 node1 上了，查看详细日志
+
+```bash
+[root@scheduler-1 install]# k describe po test-7f7bb8f449-w6wvv
+Events:
+  Type     Reason            Age   From         Message
+  ----     ------            ----  ----         -------
+  Warning  FailedScheduling  4m8s  i-scheduler  0/2 nodes are available: 1 Node:Node: scheduler-1 does not have label priority.lixueduan.com, 1 Node:Node: scheduler-2 does not have label priority.lixueduan.com. preemption: 0/2 nodes are available: 2 No preemption victims found for incoming pod.
+  Normal   Scheduled         33s   i-scheduler  Successfully assigned default/test-7f7bb8f449-w6wvv to scheduler-1
+```
+
+可以看到，也是 i-scheduler 在处理，调度到了 node1.
+
+
+
+### 多节点排序
+
+我们实现的 Score 是根据 Node 上的 `priority.lixueduan.com` 对应的 Value 作为得分的，因此肯定会调度到 Value 比较大的一个节点。
+
+
+
+给 node2 也打上 label，value 设置为 20
+
+```bash
+[root@scheduler-1 install]# k get node
+NAME          STATUS   ROLES           AGE     VERSION
+scheduler-1   Ready    control-plane   4h34m   v1.27.4
+scheduler-2   Ready    <none>          4h33m   v1.27.4
+[root@scheduler-1 install]# k label node scheduler-2 priority.lixueduan.com=20
+node/scheduler-2 labeled
+```
+
+然后更新 Deployment ，触发创建新 Pod ，测试调度逻辑。
+
+因为 Node2 上的 priority 为 20，node1 上为 10，那么肯定会调度到 node2 上。
+
+```bash
+[root@scheduler-1 install]# k get po -owide
+NAME                    READY   STATUS    RESTARTS   AGE   IP             NODE          NOMINATED NODE   READINESS GATES
+test-7f7bb8f449-krvqj   1/1     Running   0          58s   172.25.0.150   scheduler-2   <none>           <none>
+```
+
+果然，被调度到了 Node2。
+
+
+
+现在我们更新 Node1 的 label，改成 30
+
+```bash
+k label node scheduler-1 priority.lixueduan.com=30 --overwrite
+```
+
+再次更新 Deployment 触发调度
+
+```bash
+[root@scheduler-1 install]# k rollout restart deploy test
+deployment.apps/test restarted
+```
+
+这样应该是调度到 node1 了，确认一下
+
+```bash
+[root@scheduler-1 install]# k get po -owide
+NAME                   READY   STATUS    RESTARTS   AGE   IP               NODE          NOMINATED NODE   READINESS GATES
+test-f7b597544-bbcb8   1/1     Running   0          65s   172.25.123.200   scheduler-1   <none>           <none>
+```
+
+果然在 node1，说明我们的 Scheduler 是能够正常工作的。
+
+---
+
+
 [![Go Report Card](https://goreportcard.com/badge/kubernetes-sigs/scheduler-plugins)](https://goreportcard.com/report/kubernetes-sigs/scheduler-plugins) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/LICENSE)
 
 # Scheduler Plugins
